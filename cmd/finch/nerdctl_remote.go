@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,59 +21,75 @@ import (
 	"github.com/spf13/afero"
 
 	"github.com/runfinch/finch/pkg/command"
-	"github.com/runfinch/finch/pkg/config"
 	"github.com/runfinch/finch/pkg/flog"
 	"github.com/runfinch/finch/pkg/lima"
 )
 
 const nerdctlCmdName = "nerdctl"
 
-type (
-	argHandler     func(systemDeps NerdctlCommandSystemDeps, args []string, index int) error
-	commandHandler func(systemDeps NerdctlCommandSystemDeps, args []string) error
-)
-
 func (nc *nerdctlCommand) run(cmdName string, args []string) error {
+	logrus.Warn("nc.run invoked: ", append([]string{cmdName}, args...))
+
 	err := nc.assertVMIsRunning(nc.ncc, nc.logger)
 	if err != nil {
 		return err
 	}
 	var (
 		nerdctlArgs, envs, fileEnvs, cmdArgs, runArgs []string
-		skip, hasCmdHander, hasArgHandler, lastOpt    bool
+		skip, hasCmdHandler, hasArgHandler, lastOpt   bool
 		cmdHandler                                    commandHandler
 		aMap                                          map[string]argHandler
 		firstOptPos                                   int
 	)
 
+	// accumulate distributed map entities
+	maps.Copy(aliasMap, osAliasMap)
+	maps.Copy(commandHandlerMap, osCommandHandlerMap)
+	for k := range osArgHandlerMap {
+		_, ok := argHandlerMap[k]
+		if ok {
+			maps.Copy(argHandlerMap[k], osArgHandlerMap[k])
+		} else {
+			argHandlerMap[k] = make(map[string]argHandler)
+			maps.Copy(argHandlerMap[k], osArgHandlerMap[k])
+		}
+	}
+
+	//// special handling if cmdName == "buildx"; before the alias reassignment
+	//if cmdName == "buildx" {
+	//	args, err = handleBuildx(&cmdName, args, nc.logger)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
+
 	alias, hasAlias := aliasMap[cmdName]
 	if hasAlias {
 		cmdName = alias
-		cmdHandler, hasCmdHander = commandHandlerMap[alias]
+		cmdHandler, hasCmdHandler = commandHandlerMap[alias]
 		aMap, hasArgHandler = argHandlerMap[alias]
 	} else {
 		// Check if the command has a handler
-		cmdHandler, hasCmdHander = commandHandlerMap[cmdName]
+		cmdHandler, hasCmdHandler = commandHandlerMap[cmdName]
 		aMap, hasArgHandler = argHandlerMap[cmdName]
 
-		if !hasCmdHander && !hasArgHandler && len(args) > 0 {
+		if !hasCmdHandler && !hasArgHandler && len(args) > 0 {
 			// for commands like image build, container run
 			key := fmt.Sprintf("%s %s", cmdName, args[0])
-			cmdHandler, hasCmdHander = commandHandlerMap[key]
+			cmdHandler, hasCmdHandler = commandHandlerMap[key]
 			aMap, hasArgHandler = argHandlerMap[key]
 		}
 	}
 
 	// First check if the command has command handler
-	if hasCmdHander {
-		err := cmdHandler(nc.systemDeps, args)
+	if hasCmdHandler {
+		err := cmdHandler(nc.systemDeps, nc.fc, &cmdName, &args)
 		if err != nil {
 			return err
 		}
 	}
 
 	switch cmdName {
-
 	case "container run", "exec", "compose":
 		// check if an option flag is present; immediately following the command
 		switch {
@@ -92,13 +109,13 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 		shortFlagArgSet := cmdFlagSetMap[cmdName]["shortArgFlags"]
 
 		for i, arg := range args {
-			// Check if command requires arg handling
+			// Check if individual argument (and possibly following value) requires manipulation-in-place handling
 			if hasArgHandler {
 				// Check if argument for the command needs handling, sometimes it can be --file=<filename>
 				b, _, _ := strings.Cut(arg, "=")
 				h, ok := aMap[b]
 				if ok {
-					err = h(nc.systemDeps, args, i)
+					err = h(nc.systemDeps, nc.fc, args, i)
 					if err != nil {
 						return err
 					}
@@ -106,7 +123,7 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 					arg = args[i]
 				}
 			}
-			arg = handleCache(nc.fc, arg)
+
 			// parsing arguments from the command line
 			// may pre-fetch and consume the next argument;
 			// the loop variable will skip any pre-consumed args
@@ -149,11 +166,6 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 				}
 				skip = shouldSkip
 				fileEnvs = append(fileEnvs, addEnvs...)
-				// This is a docker specific command which alias for --output=type=docker. This should only applied for build args.
-			// On a long term this run command potentially needs to be refactored, currently it is too hacky the way it handles the args.
-			case arg == "--load":
-				nc.logger.Info("found --load converting to --output flag")
-				nerdctlArgs = handleLoad(nc.fc, nerdctlArgs)
 			case argIsEnv(arg):
 				// exact match to either -e or --env
 				// or arg begins with -e or --env
@@ -164,18 +176,27 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 				if addEnv != "" {
 					envs = append(envs, addEnv)
 				}
-			case longFlagBoolSet.Has(strings.Split(arg, "=")[0]) || longFlagBoolSet.Has(arg):
-				// exact match to a short flag: -?
+			case shortFlagBoolSet.Has(arg) || longFlagBoolSet.Has(arg):
+				// exact match to a short no argument flag: -?
 				// or exact match to: --<long_flag>
 				nerdctlArgs = append(nerdctlArgs, arg)
+			case longFlagBoolSet.Has(strings.Split(arg, "=")[0]):
+				// begins with --<long_flag>
+				//    e.g. --sig-proxy=false
+				nerdctlArgs = append(nerdctlArgs, arg)
 			case shortFlagBoolSet.Has(arg[:2]):
-				// begins with a defined short flag, but is adjacent to one or more short flags: -????
+				// or begins with a defined short no argument flag, but is adjacent to something
+				//   -????   one or more short bool flags; no following values
+				//   -????="<value>" one or more short bool flags ending with a short arg flag equated to value
+				//   -????"<value>" one or more short bool flags ending with a short arg flag concatenated to value
 				addArg := nc.handleMultipleShortFlags(shortFlagBoolSet, shortFlagArgSet, args, i)
 				nerdctlArgs = append(nerdctlArgs, addArg)
 			case shortFlagArgSet.Has(arg) || shortFlagArgSet.Has(arg[:2]):
-				// exact match to: -h,-m,-u,-w,-p,-l,-v
-				// or begins with: -h,-m,-u,-w,-p,-l,-v
-				//     concatenated short flags and values: -p"8080:8080"
+				// exact match to a short arg flag: -?
+				//     next arg must be the <value>
+				// or begins with a short arg flag:
+				//     short arg flag concatenated to value: -?"<value>"
+				//     short arg flag equated to value: -?="<value>" or -?=<value>
 				shouldSkip, addKey, addVal := nc.handleFlagArg(arg, args[i+1])
 				skip = shouldSkip
 				if addKey != "" {
@@ -183,7 +204,11 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 					nerdctlArgs = append(nerdctlArgs, addVal)
 				}
 			case strings.HasPrefix(arg, "--"):
-				// --<long_flag>="<value>", --<long_flag> "<value>"
+				// exact match to a long arg flag: -<long_flag>
+				//     next arg must be the <value>
+				// or begins with a long arg flag:
+				//     long arg flag concatenated to value: --<long_flag>"<value>"
+				//     long arg flag equated to value: --<long_flag>="<value>" or --<long_flag>=<value>
 				shouldSkip, addKey, addVal := nc.handleFlagArg(arg, args[i+1])
 				skip = shouldSkip
 				if addKey != "" {
@@ -235,13 +260,13 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 	default:
 
 		for i, arg := range args {
-			// Check if command requires arg handling
+			// Check if individual argument (and possibly following value) requires manipulation-in-place handling
 			if hasArgHandler {
 				// Check if argument for the command needs handling, sometimes it can be --file=<filename>
 				b, _, _ := strings.Cut(arg, "=")
 				h, ok := aMap[b]
 				if ok {
-					err = h(nc.systemDeps, args, i)
+					err = h(nc.systemDeps, nc.fc, args, i)
 					if err != nil {
 						return err
 					}
@@ -255,9 +280,6 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 				nc.logger.SetLevel(flog.Debug)
 			case arg == "--help":
 				nerdctlArgs = append(nerdctlArgs, arg)
-			case arg == "--load":
-				nc.logger.Info("found --load converting to --output flag")
-				nerdctlArgs = handleLoad(nc.fc, nerdctlArgs)
 			default:
 				nerdctlArgs = append(nerdctlArgs, arg)
 			}
@@ -295,7 +317,7 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 		if slices.Contains(args, "run") {
 			ensureRemoteCredentials(nc.fc, nc.ecc, &additionalEnv, nc.logger)
 		}
-	case "build", "pull", "push", "run":
+	case "build", "pull", "push", "container run":
 		ensureRemoteCredentials(nc.fc, nc.ecc, &additionalEnv, nc.logger)
 	}
 
@@ -314,15 +336,9 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 		return nc.ncc.RunWithReplacingStdout([]command.Replacement{{Source: "nerdctl", Target: "finch"}}, runArgs...)
 	}
 
-	// Handle buildx version and build commands.
-	skipCmd, runArgs := handleBuildx(nc.fc, runArgs)
-	if skipCmd {
-		return nil
-	}
+	//runArgs = handleDockerCompatInspect(nc.fc, runArgs)
 
-	runArgs = handleDockerCompatInspect(nc.fc, runArgs)
-
-	nc.logger.Info("Running nerdctl command args ", runArgs, "  end")
+	logrus.Warn("Attempting to run: ", runArgs)
 
 	return nc.ncc.Create(runArgs...).Run()
 }
@@ -523,128 +539,55 @@ func handleEnvFile(fs afero.Fs, systemDeps NerdctlCommandSystemDeps, arg, arg2 s
 	return skip, envs, nil
 }
 
-func handleCache(fc *config.Finch, arg string) string {
-	// Hack to handle consistency params during mounts. This is assuming no other commands or env variable will have the word consistency.
-	if fc.Mode == nil || *fc.Mode != "dockercompat" || runtime.GOOS != "darwin" {
-		return arg
-	}
-
-	if strings.Contains(arg, "consistency") {
-		arg = strings.Replace(arg, ",consistency=cache", "", 1)
-		arg = strings.Replace(arg, ",consistency=delegated", "", 1)
-		arg = strings.Replace(arg, ",consistency=consistent", "", 1)
-	}
-	return arg
-}
-
-func handleLoad(fc *config.Finch, args []string) []string {
-	if fc.Mode == nil || *fc.Mode != "dockercompat" || args == nil {
-		return args
-	}
-
-	if *fc.Mode == "dockercompat" {
-		logrus.Warn("appending --output-type!!")
-		logrus.Warn("args before appending", args)
-		args = append(args, "--output=type=docker")
-		logrus.Warn("args after appending", args)
-	}
-
-	return args
-}
-
-func handleDockerCompatInspect(fc *config.Finch, args []string) []string {
-
-	if fc.Mode == nil || *fc.Mode != "dockercompat" {
-		return args
-	}
-
-	newArgList := []string{}
-	isInspect := false
-	inspectIndex := -1
-	skipNext := false
-	inspectType := ""
-
-	for idx, arg := range args {
-		if skipNext {
-			skipNext = false
-			continue
-		}
-		if arg == "inspect" {
-			isInspect = true
-			inspectIndex = idx
-			newArgList = append(newArgList, arg)
-		}
-
-		if strings.Contains(arg, "--type") && (idx < len(args)+1) && isInspect {
-			if strings.Contains(arg, "=") {
-				inspectType = strings.Split(arg, "=")[1]
-			} else {
-				inspectType = args[idx+1]
-			}
-			if arg == "--type" {
-				skipNext = true
-			}
-			continue
-		}
-		newArgList = append(newArgList, arg)
-
-	}
-
-	if !isInspect {
-		return args
-	}
-
-	switch inspectType {
-	case "container":
-		newArgList = append(newArgList[:inspectIndex], append([]string{inspectType}, append([]string{newArgList[inspectIndex+1]}, append([]string{"--mode=dockercompat"}, newArgList[inspectIndex+2:]...)...)...)...)
-	case "":
-		break
-	default:
-		newArgList = append(newArgList[:inspectIndex], append([]string{inspectType}, newArgList[inspectIndex+1:]...)...)
-	}
-
-	return newArgList
-}
-
-func handleBuildx(fc *config.Finch, limaArgs []string) (bool, []string) {
-	logrus.Warn("handling buildx")
-
-	buildx := false
-	skipCmd := true
-	var newLimaArgs []string
-	buildxSubcommands := []string{"bake", "create", "debug", "du", "imagetools", "inspect", "ls", "prune", "rm", "stop", "use", "version"}
-
-	if fc.Mode == nil || *fc.Mode != "dockercompat" {
-		return !skipCmd, limaArgs
-	}
-
-	for idx, arg := range limaArgs {
-		logrus.Warnf("looking at arg %s at index %d", arg, idx)
-		if arg == "buildx" {
-			buildx = true
-			newLimaArgs = append(newLimaArgs, "build")
-			logrus.Warn("buildx is not supported. using standard buildkit instead...")
-		}
-
-		if buildx {
-
-			buildxWarnMsg := "buildx %s command is not supported."
-
-			if arg == "build" {
-				logrus.Warnf("found build")
-				continue
-			} else if slices.Contains(buildxSubcommands, arg) {
-				logrus.Warnf(buildxWarnMsg, arg)
-				return skipCmd, nil
-			}
-
-			logrus.Warnf("appending build")
-			newLimaArgs = append(newLimaArgs, arg)
-
-		} else {
-			newLimaArgs = append(newLimaArgs, arg)
-		}
-	}
-
-	return !skipCmd, newLimaArgs
-}
+//func handleDockerCompatInspect(fc *config.Finch, args []string) []string {
+//	//if fc == nil || fc.Mode == nil || *fc.Mode != "dockercompat" {
+//	//	return args
+//	//}
+//
+//	newArgList := []string{}
+//	isInspect := false
+//	inspectIndex := -1
+//	skipNext := false
+//	inspectType := ""
+//
+//	for idx, arg := range args {
+//		if skipNext {
+//			skipNext = false
+//			continue
+//		}
+//		if arg == "inspect" {
+//			isInspect = true
+//			inspectIndex = idx
+//			newArgList = append(newArgList, arg)
+//			continue
+//		}
+//
+//		if strings.Contains(arg, "--type") && (idx < len(args)-1) && isInspect {
+//			if strings.Contains(arg, "=") {
+//				inspectType = strings.Split(arg, "=")[1]
+//			} else {
+//				inspectType = args[idx+1]
+//				skipNext = true
+//			}
+//			continue
+//		}
+//		newArgList = append(newArgList, arg)
+//	}
+//
+//	if !isInspect {
+//		return args
+//	}
+//
+//	switch inspectType {
+//	case "container":
+//		dcTrailingArgs := append([]string{"--mode=dockercompat"}, newArgList[inspectIndex+2:]...)
+//		dcMidArgs := append([]string{inspectType}, append([]string{newArgList[inspectIndex+1]}, dcTrailingArgs...)...)
+//		newArgList = append(newArgList[:inspectIndex], dcMidArgs...)
+//	case "":
+//		break
+//	default:
+//		newArgList = append(newArgList[:inspectIndex], append([]string{inspectType}, newArgList[inspectIndex+1:]...)...)
+//	}
+//
+//	return newArgList
+//}

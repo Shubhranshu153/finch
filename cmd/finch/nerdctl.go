@@ -6,7 +6,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
+	"github.com/sirupsen/logrus"
 	"golang.org/x/exp/slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -40,6 +42,11 @@ type nerdctlCommandCreator struct {
 	fs         afero.Fs
 	fc         *config.Finch
 }
+
+type (
+	argHandler     func(systemDeps NerdctlCommandSystemDeps, fc *config.Finch, args []string, index int) error
+	commandHandler func(systemDeps NerdctlCommandSystemDeps, fc *config.Finch, cmdName *string, args *[]string) error
+)
 
 func newNerdctlCommandCreator(
 	ncc command.NerdctlCmdCreator,
@@ -196,6 +203,23 @@ var dockerCompatCmds = map[string]string{
 	"buildx": "build version",
 }
 
+var aliasMap = map[string]string{
+	"build": "image build",
+	"run":   "container run",
+	"cp":    "container cp",
+}
+
+var commandHandlerMap = map[string]commandHandler{
+	"buildx":  handleBuildx,
+	"inspect": handleDockerCompatInspect,
+}
+
+var argHandlerMap = map[string]map[string]argHandler{
+	"image build": {
+		"--load": handleDockerBuildLoad,
+	},
+}
+
 var cmdFlagSetMap = map[string]map[string]sets.Set[string]{
 	"container run": {
 		"shortBoolFlags": sets.New[string]("-d", "-i", "-t"),
@@ -218,4 +242,90 @@ var cmdFlagSetMap = map[string]map[string]sets.Set[string]{
 			"--privileged", "--read-only", "--rm", "--rootfs", "--tty"),
 		"shortArgFlags": sets.New[string]("-e", "-h", "-m", "-u", "-w", "-p", "-l", "-v"),
 	},
+}
+
+// converts "docker build --load" flag to "nerdctl build --output=type=docker"
+func handleDockerBuildLoad(systemDeps NerdctlCommandSystemDeps, fc *config.Finch, nerdctlCmdArgs []string, index int) error {
+	if fc.Mode != nil && *fc.Mode == "docker" {
+		nerdctlCmdArgs[index] = "--output=type=docker"
+	}
+
+	return nil
+}
+
+func handleBuildx(_ NerdctlCommandSystemDeps, _ *config.Finch, cmdName *string, args *[]string) error {
+	if cmdName != nil && *cmdName == "buildx" {
+		subCmd := (*args)[0]
+		buildxSubcommands := []string{"bake", "create", "debug", "du", "imagetools", "inspect", "ls", "prune", "rm", "stop", "use", "version"}
+
+		if slices.Contains(buildxSubcommands, subCmd) {
+			return fmt.Errorf("Unsupported buildx command: %s", subCmd)
+		}
+
+		if subCmd == "build" {
+			*args = (*args)[1:]
+		}
+		*cmdName = "build"
+	}
+	// else, continue with the original command
+	return nil
+}
+
+func handleDockerCompatInspect(_ NerdctlCommandSystemDeps, fc *config.Finch, cmdName *string, args *[]string) error {
+	if fc.Mode == nil || *fc.Mode != "dockercompat" {
+		return nil
+	}
+
+	if *args == nil {
+		return fmt.Errorf("Invalid arguments: args (null pointer)")
+	}
+
+	modeDockerCompat := `--mode=dockercompat`
+	inspectType := ""
+	sizeArg := ""
+	savedArgs := []string{}
+
+	for idx, arg := range *args {
+		if (arg == "--type") && (idx < len(*args)-1) {
+			inspectType = (*args)[idx+1]
+			continue
+		}
+
+		if strings.Contains(arg, "--type") && strings.Contains(arg, "=") {
+			inspectType = strings.Split(arg, "=")[1]
+			continue
+		}
+
+		if (arg == "--size") || (arg == "-s") {
+			sizeArg = "--size"
+			continue
+		}
+
+		savedArgs = append(savedArgs, arg)
+	}
+
+	logrus.Warn("DockerCompatInspect SavedArgs: ", savedArgs)
+
+	switch inspectType {
+	case "image":
+		*cmdName = "image inspect"
+		*args = append([]string{modeDockerCompat}, savedArgs...)
+	case "volume":
+		*cmdName = "volume inspect"
+		if sizeArg != "" {
+			*args = append([]string{sizeArg}, savedArgs...)
+		} else {
+			*args = append([]string{}, savedArgs...)
+		}
+	case "container":
+		*cmdName = "inspect"
+		*args = append([]string{modeDockerCompat}, savedArgs...)
+	case "":
+		*cmdName = "inspect"
+		*args = append([]string{modeDockerCompat}, savedArgs...)
+	default:
+		return fmt.Errorf("Unsupported inspect type: %s", inspectType)
+	}
+
+	return nil
 }

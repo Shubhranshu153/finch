@@ -38,6 +38,7 @@ type SharedSystemSettings struct {
 type SharedSettings struct {
 	Snapshotters []string `yaml:"snapshotters,omitempty"`
 	CredsHelpers []string `yaml:"creds_helpers,omitempty"`
+	Mode         *string  `yaml:"mode,omitempty"`
 }
 
 // Nerdctl is a copy from github.com/containerd/nerdctl/cmd/nerdctl/main.go
