@@ -88,7 +88,11 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 		)
 	}
 
-	return nc.ncc.Create(cmdArgs...).Run()
+	cmd := nc.ncc.Create(cmdArgs...)
+	if getInspectType() == "container" && *nc.fc.Mode == "dockercompat" {
+		return inspectContainerOutputHandler(cmd)
+	}
+	return cmd.Run()
 }
 
 var osAliasMap = map[string]string{}

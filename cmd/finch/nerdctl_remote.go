@@ -337,10 +337,12 @@ func (nc *nerdctlCommand) run(cmdName string, args []string) error {
 	}
 
 	//runArgs = handleDockerCompatInspect(nc.fc, runArgs)
+	cmd := nc.ncc.Create(runArgs...)
+	if getInspectType() == "container" && *nc.fc.Mode == "dockercompat" {
+		return inspectContainerOutputHandler(cmd)
+	}
 
-	logrus.Warn("Attempting to run: ", runArgs)
-
-	return nc.ncc.Create(runArgs...).Run()
+	return cmd.Run()
 }
 
 func (nc *nerdctlCommand) assertVMIsRunning(creator command.NerdctlCmdCreator, logger flog.Logger) error {
@@ -540,7 +542,7 @@ func handleEnvFile(fs afero.Fs, systemDeps NerdctlCommandSystemDeps, arg, arg2 s
 }
 
 //func handleDockerCompatInspect(fc *config.Finch, args []string) []string {
-//	//if fc == nil || fc.Mode == nil || *fc.Mode != "dockercompat" {
+//	//if fc == nil || fc.Mode == nil || *fc.Mode != "" {
 //	//	return args
 //	//}
 //

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/exp/slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -244,6 +243,8 @@ var cmdFlagSetMap = map[string]map[string]sets.Set[string]{
 	},
 }
 
+var gInspectType = ""
+
 // converts "docker build --load" flag to "nerdctl build --output=type=docker"
 func handleDockerBuildLoad(systemDeps NerdctlCommandSystemDeps, fc *config.Finch, nerdctlCmdArgs []string, index int) error {
 	if fc.Mode != nil && *fc.Mode == "docker" {
@@ -272,6 +273,7 @@ func handleBuildx(_ NerdctlCommandSystemDeps, _ *config.Finch, cmdName *string, 
 }
 
 func handleDockerCompatInspect(_ NerdctlCommandSystemDeps, fc *config.Finch, cmdName *string, args *[]string) error {
+
 	if fc.Mode == nil || *fc.Mode != "dockercompat" {
 		return nil
 	}
@@ -283,11 +285,13 @@ func handleDockerCompatInspect(_ NerdctlCommandSystemDeps, fc *config.Finch, cmd
 	modeDockerCompat := `--mode=dockercompat`
 	inspectType := ""
 	sizeArg := ""
+	skipArg := false
 	savedArgs := []string{}
 
 	for idx, arg := range *args {
 		if (arg == "--type") && (idx < len(*args)-1) {
 			inspectType = (*args)[idx+1]
+			skipArg = true
 			continue
 		}
 
@@ -301,11 +305,15 @@ func handleDockerCompatInspect(_ NerdctlCommandSystemDeps, fc *config.Finch, cmd
 			continue
 		}
 
+		if skipArg {
+			skipArg = false
+			continue
+		}
+
 		savedArgs = append(savedArgs, arg)
 	}
 
-	logrus.Warn("DockerCompatInspect SavedArgs: ", savedArgs)
-
+	gInspectType = inspectType
 	switch inspectType {
 	case "image":
 		*cmdName = "image inspect"
@@ -323,9 +331,14 @@ func handleDockerCompatInspect(_ NerdctlCommandSystemDeps, fc *config.Finch, cmd
 	case "":
 		*cmdName = "inspect"
 		*args = append([]string{modeDockerCompat}, savedArgs...)
+		inspectType = "container"
 	default:
 		return fmt.Errorf("Unsupported inspect type: %s", inspectType)
 	}
 
 	return nil
+}
+
+func getInspectType() string {
+	return gInspectType
 }
