@@ -45,8 +45,29 @@ func resolveIP(host string, logger flog.Logger, _ command.Creator) (string, erro
 	return host, nil
 }
 
-func handleBindMountPath(_ NerdctlCommandSystemDeps, _ map[string]string) error {
-	// Do nothing by default
+func handleBindMountPath(_ NerdctlCommandSystemDeps, m map[string]string) error {
+	// For MacOS, ensure proper permissions for .vscode-server directory
+	// Add rwx options to ensure executables work properly in bind mounts
+	
+	// Check if we have a source path
+	if _, hasSource := m["source"]; hasSource {
+		// Keep existing options if any
+		if _, hasOptions := m["options"]; !hasOptions {
+			// Set default options to ensure proper permissions
+			m["options"] = "rbind,exec,rw"
+		} else if !strings.Contains(m["options"], "exec") {
+			// Append exec option if not present
+			m["options"] = m["options"] + ",exec"
+		}
+	} else if _, hasSource := m["src"]; hasSource {
+		// Same for src key
+		if _, hasOptions := m["options"]; !hasOptions {
+			m["options"] = "rbind,exec,rw"
+		} else if !strings.Contains(m["options"], "exec") {
+			m["options"] = m["options"] + ",exec"
+		}
+	}
+	
 	return nil
 }
 
