@@ -50,7 +50,14 @@ func handleBindMountPath(_ NerdctlCommandSystemDeps, m map[string]string) error 
 	// Add rwx options to ensure executables work properly in bind mounts
 	
 	// Check if we have a source path
-	if _, hasSource := m["source"]; hasSource {
+	sourcePath := ""
+	if src, hasSource := m["source"]; hasSource {
+		sourcePath = src
+	} else if src, hasSource := m["src"]; hasSource {
+		sourcePath = src
+	}
+
+	if sourcePath != "" {
 		// Keep existing options if any
 		if _, hasOptions := m["options"]; !hasOptions {
 			// Set default options to ensure proper permissions
@@ -59,12 +66,40 @@ func handleBindMountPath(_ NerdctlCommandSystemDeps, m map[string]string) error 
 			// Append exec option if not present
 			m["options"] = m["options"] + ",exec"
 		}
-	} else if _, hasSource := m["src"]; hasSource {
-		// Same for src key
-		if _, hasOptions := m["options"]; !hasOptions {
-			m["options"] = "rbind,exec,rw"
-		} else if !strings.Contains(m["options"], "exec") {
-			m["options"] = m["options"] + ",exec"
+
+		// If this is a .vscode-server directory mount, ensure it has proper permissions
+		if strings.Contains(sourcePath, ".vscode-server") {
+			// Get base directory (/home/vscode)
+			baseDir := filepath.Dir(filepath.Dir(sourcePath))
+			
+			// Ensure parent directories exist with proper permissions
+			if err := os.MkdirAll(baseDir, 0777); err != nil {
+				return fmt.Errorf("failed to create parent directories with proper permissions: %v", err)
+			}
+			
+			// Ensure .vscode-server directory exists with proper permissions
+			if err := os.MkdirAll(sourcePath, 0777); err != nil {
+				return fmt.Errorf("failed to create .vscode-server directory with proper permissions: %v", err)
+			}
+
+			// Walk through the directory and ensure all files and subdirectories have proper permissions
+			err := filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				// For both directories and files, ensure full rwx permissions
+				// This is needed for executables like the VS Code server and node
+				return os.Chmod(path, 0777)
+			})
+			if err != nil {
+				return fmt.Errorf("failed to set permissions for .vscode-server contents: %v", err)
+			}
+			
+			// Also set permissions on the parent .vscode directory
+			vsCodeDir := filepath.Dir(sourcePath)
+			if err := os.Chmod(vsCodeDir, 0777); err != nil {
+				return fmt.Errorf("failed to set permissions for .vscode directory: %v", err)
+			}
 		}
 	}
 	
