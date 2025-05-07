@@ -108,11 +108,38 @@ func (nc *nerdctlCommand) shouldReplaceForHelp(cmdName string, args []string) bo
 		}
 	}
 
-	// this needs to handle cases of -h except for `container run`,`run`,`create`. For these options -h represent hostname
-	// TODO: Refactor this function.
+	// For "container run", "run", and "create" commands, "-h" can either be:
+	// 1. A help request when used alone as "-h"
+	// 2. A hostname flag when used with a value like "-h hostname"
+	// For all other commands, "-h" always means help
+	
+	// Handle "--help" for all commands
 	for _, arg := range args {
-		if arg == "--help" || (arg == "-h" && (cmdName != "container run" && cmdName != "run" && cmdName != "create")) {
+		if arg == "--help" {
 			return true
+		}
+	}
+	
+	// Special handling for "run", "container run", "create" commands
+	if cmdName == "container run" || cmdName == "run" || cmdName == "create" {
+		// If "-h" is alone (not followed by a value), treat it as help
+		for i, arg := range args {
+			if arg == "-h" {
+				// Check if it's the last argument or next argument starts with dash
+				// In these cases, treat it as help request
+				if i == len(args)-1 || strings.HasPrefix(args[i+1], "-") {
+					return true
+				}
+				// Otherwise, it has a value, so it's the hostname flag
+				break
+			}
+		}
+	} else {
+		// For all other commands, "-h" always means help
+		for _, arg := range args {
+			if arg == "-h" {
+				return true
+			}
 		}
 	}
 
