@@ -3,10 +3,12 @@
 
 //go:build darwin
 
-package main
+package finch
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	dockerops "github.com/docker/docker/opts"
@@ -62,9 +64,25 @@ func handleBindMountPath(_ NerdctlCommandSystemDeps, m map[string]string) error 
 		if _, hasOptions := m["options"]; !hasOptions {
 			// Set default options to ensure proper permissions
 			m["options"] = "rbind,exec,rw"
-		} else if !strings.Contains(m["options"], "exec") {
-			// Append exec option if not present
-			m["options"] = m["options"] + ",exec"
+		} else {
+			// Ensure the mount has exec and rw options
+			opts := strings.Split(m["options"], ",")
+			hasExec := false
+			hasRw := false
+			for _, opt := range opts {
+				if opt == "exec" {
+					hasExec = true
+				}
+				if opt == "rw" {
+					hasRw = true
+				}
+			}
+			if !hasExec {
+				m["options"] = m["options"] + ",exec"
+			}
+			if !hasRw {
+				m["options"] = m["options"] + ",rw"
+			}
 		}
 
 		// If this is a .vscode-server directory mount, ensure it has proper permissions
@@ -87,9 +105,16 @@ func handleBindMountPath(_ NerdctlCommandSystemDeps, m map[string]string) error 
 				if err != nil {
 					return err
 				}
-				// For both directories and files, ensure full rwx permissions
-				// This is needed for executables like the VS Code server and node
-				return os.Chmod(path, 0777)
+				// For directories, ensure rwx permissions
+				if info.IsDir() {
+					return os.Chmod(path, 0755)
+				}
+				// For executable files (like node), ensure rwx permissions
+				if info.Mode()&0111 != 0 {
+					return os.Chmod(path, 0755)
+				}
+				// For regular files, ensure rw permissions
+				return os.Chmod(path, 0644)
 			})
 			if err != nil {
 				return fmt.Errorf("failed to set permissions for .vscode-server contents: %v", err)
